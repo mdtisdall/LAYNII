@@ -17,6 +17,7 @@
             pkgs.gnumake
             pkgs.codespell
             pkgs.gh
+            pkgs.python3
           ];
         };
       });

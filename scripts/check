@@ -6,6 +6,7 @@
 # 1. Build every program with the pinned GCC and zlib from flake.nix.
 # 2. Run each `../LN...` line of test_data/tests.sh in a scratch copy of
 #    test_data, so outputs do not land in the tree. Any non-zero exit fails.
+# 3. Run each test_data/test_<PROGRAM>.py correctness test on its program.
 #
 # Set LAYNII_CHECK_ALL=1 to also run the slow tests in SLOW.
 set -euo pipefail
@@ -54,8 +55,22 @@ while IFS= read -r line; do
   fi
 done < <(grep -E '^\.\./LN' test_data/tests.sh)
 
+echo "== Correctness tests"
+# Each test_data/test_<PROGRAM>.py takes the program's binary as its argument.
+for test in test_data/test_*.py; do
+  prog=$(basename "$test" .py)
+  prog=${prog#test_}
+  if python3 "$test" "./$prog" >"$work/test_$prog.log" 2>&1; then
+    echo "ok    $test"
+  else
+    echo "FAIL  $test"
+    tail -n 20 "$work/test_$prog.log" | sed 's/^/      /'
+    failed+=("$test")
+  fi
+done
+
 if [ ${#failed[@]} -ne 0 ]; then
-  echo "scripts/check: ${#failed[@]} smoke test(s) failed: ${failed[*]}" >&2
+  echo "scripts/check: ${#failed[@]} test(s) failed: ${failed[*]}" >&2
   exit 1
 fi
 echo "scripts/check: all checks passed"
