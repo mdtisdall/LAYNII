@@ -59,3 +59,11 @@ output
 
 # Ignore this unless if you are intentionallyc hanging the default window placings
 /ida/src/imgui.ini
+
+# =============================================================================
+# direnv, and this project's GitHub token (dev-workflow)
+.direnv/
+.envrc.local
+.envrc.local.*
+# One git worktree for each task (dev-workflow start-task)
+.worktrees/

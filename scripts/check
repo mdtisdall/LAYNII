@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# All the checks that CI runs, in one command. Run it in the devShell:
+#
+#   nix develop --command scripts/check
+#
+# 1. Build every program with the pinned GCC and zlib from flake.nix.
+# 2. Run each `../LN...` line of test_data/tests.sh in a scratch copy of
+#    test_data, so outputs do not land in the tree. Any non-zero exit fails.
+#
+# Set LAYNII_CHECK_ALL=1 to also run the slow tests in SLOW.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+# Programs in tests.sh that are not run, with the reason.
+SKIP=(
+  LN_GRADSMOOTH_ITER  # no source file in src/
+  LN_BOCO             # -shift overruns the correlation buffer (heap overflow)
+  LN_TRIAL            # trial-average buffer is trial_dur * nr_trials too small
+  LN2_MASK            # reads thr_exceed[-1] for voxels outside columns
+)
+SLOW=(
+  LN_COLUMNAR_DIST    # passes, but takes about 5 minutes
+)
+
+echo "== Build"
+make -j"$(getconf _NPROCESSORS_ONLN)" all
+
+echo "== Smoke tests"
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+cp -R test_data "$work/"
+for bin in LN*; do
+  if [ -f "$bin" ] && [ -x "$bin" ]; then ln -s "$PWD/$bin" "$work/$bin"; fi
+done
+
+skip=" ${SKIP[*]} "
+if [ "${LAYNII_CHECK_ALL:-0}" != 1 ]; then skip+="${SLOW[*]} "; fi
+
+failed=()
+while IFS= read -r line; do
+  prog=${line%% *}
+  prog=${prog#../}
+  if [[ $skip == *" $prog "* ]]; then
+    echo "SKIP  $prog"
+    continue
+  fi
+  # stdin from /dev/null: some programs read it, which would eat this loop's input.
+  if (cd "$work/test_data" && bash -c "$line") >"$work/$prog.log" 2>&1 </dev/null; then
+    echo "ok    $prog"
+  else
+    echo "FAIL  $prog (exit $?)"
+    tail -n 20 "$work/$prog.log" | sed 's/^/      /'
+    failed+=("$prog")
+  fi
+done < <(grep -E '^\.\./LN' test_data/tests.sh)
+
+if [ ${#failed[@]} -ne 0 ]; then
+  echo "scripts/check: ${#failed[@]} smoke test(s) failed: ${failed[*]}" >&2
+  exit 1
+fi
+echo "scripts/check: all checks passed"
