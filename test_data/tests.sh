@@ -2,7 +2,7 @@
 # For internal testing. Just to check whether programs execute.
 
 ../LN2_LAYER_SMOOTH -input sc_VASO_act.nii.gz -layer_file sc_layers.nii.gz -FWHM 1
-../LN2_LAYER_NORMALIZE -input lo_BOLD_act.nii.gz -layer_file lo_columns.nii.gz
+../LN2_COLUMN_NORMALIZE -input lo_BOLD_act.nii.gz -column_file lo_columns.nii.gz -layer_file lo_layers.nii.gz
 ../LN_LAYER_SMOOTH -input sc_VASO_act.nii.gz -layer_file sc_layers.nii.gz -FWHM 0.3 -NoKissing
 
 ../LN_BOCO -Nulled lo_Nulled_intemp.nii.gz -BOLD lo_BOLD_intemp.nii.gz -trialBOCO 40 -shift
