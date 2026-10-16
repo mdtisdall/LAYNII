@@ -158,6 +158,26 @@ def test_empty_cell(binary, tmp):
     check(out, data, "empty cell")
 
 
+def test_nokissing(binary, tmp):
+    # Three blocks in a row (x = 0..1, 2..3, 4..5). The outer two have the
+    # same label, so without -NoKissing they are one column. With
+    # -NoKissing they are two pieces, and the result must be the same as
+    # with three different labels.
+    shape = (6, 2, 2)
+    split = [{0: 1, 1: 2, 2: 1}[x // 2] for x, y, z in coords(shape)]
+    three = [x // 2 + 1 for x, y, z in coords(shape)]
+    layers = [z + 1 for x, y, z in coords(shape)]
+    data = [{1: 10.0, 2: 4.0, 3: 0.0}[c] + (1 if z else -1) * (x % 2 - 0.5)
+            for (x, y, z), c in zip(coords(shape), three)]
+    exp = run(binary, tmp, data, three, layers, "-lambda", "2", shape=shape)
+    out = run(binary, tmp, data, split, layers, "-lambda", "2", "-NoKissing",
+              shape=shape)
+    check(out, exp, "-NoKissing")
+    out = run(binary, tmp, data, split, layers, "-lambda", "2", shape=shape)
+    assert any(abs(a - b) > 1e-3 for a, b in zip(out, exp)), \
+        "without -NoKissing the split label should be one column"
+
+
 def test_joint4d(binary, tmp):
     # One layer, so n = 8 in each cell. Volume 1 has d = 4 and volume 2 has
     # d = 1. With lambda = 2, volume 2 joins on its own (threshold 1) and
@@ -190,7 +210,7 @@ def main():
         sys.exit(__doc__)
     binary = os.path.abspath(sys.argv[1])
     tests = [test_lambda_zero, test_shrink_and_replace, test_join,
-             test_empty_cell, test_joint4d]
+             test_empty_cell, test_nokissing, test_joint4d]
     with tempfile.TemporaryDirectory() as tmp:
         for test in tests:
             test(binary, tmp)

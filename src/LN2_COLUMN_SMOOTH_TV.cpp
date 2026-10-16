@@ -51,6 +51,11 @@ int show_help(void) {
     "                   volumes (layers x volumes) and solve one problem.\n"
     "                   Without this option, each volume is smoothed\n"
     "                   separately.\n"
+    "    -NoKissing   : (Optional) Use each spatially connected piece\n"
+    "                   (26-neighborhood) of a column as its own column. Use\n"
+    "                   this when a column touches itself across sulci. All\n"
+    "                   voxels with the column label connect the pieces,\n"
+    "                   also voxels without a layer label.\n"
     "    -tol         : (Optional) Accuracy. The solver stops when the RMS,\n"
     "                   over the smoothed voxels, of the difference from\n"
     "                   the exact optimal output is at most tol x scale,\n"
@@ -244,6 +249,7 @@ static int solve_tv(vector<double>& u, const vector<double>& x,
 
 int main(int argc, char* argv[]) {
     bool use_outpath = false, do_masking = false, replace = false, joint4d = false;
+    bool nokissing = false;
     char *fout = NULL, *f_input = NULL, *f_column = NULL, *f_layer = NULL;
     double lambda = -1;
     int max_iter = 100000;
@@ -296,6 +302,9 @@ int main(int argc, char* argv[]) {
         } else if (!strcmp(argv[ac], "-joint4D")) {
             joint4d = true;
             cout << "Smooth all volumes together."  << endl;
+        } else if (!strcmp(argv[ac], "-NoKissing")) {
+            nokissing = true;
+            cout << "Use each connected piece of a column as its own column."  << endl;
         } else if (!strcmp(argv[ac], "-mask")) {
             do_masking = true;
             cout << "Set voxels to zero outside columns (mask option)"  << endl;
@@ -379,21 +388,61 @@ int main(int argc, char* argv[]) {
     nifti_image* nii_layer = copy_nifti_as_int32(nii3);
     int32_t* nii_layer_data = static_cast<int32_t*>(nii_layer->data);
 
+    // ========================================================================
+    // Find the node (column, or connected piece) that each voxel belongs to
+    // ========================================================================
+    vector<int32_t> node(nr_voxels, 0);  // 0 = not a column
+    int32_t nr_cols = 0;
+    if (!nokissing) {
+        for (int64_t i = 0; i < nr_voxels; ++i) {
+            node[i] = max(*(nii_column_data + i), 0);
+            nr_cols = max(nr_cols, node[i]);
+        }
+    } else {
+        // Flood fill each connected piece of each column with a new id
+        vector<int64_t> queue;
+        for (int64_t i = 0; i < nr_voxels; ++i) {
+            int32_t label_i = *(nii_column_data + i);
+            if (label_i <= 0 || node[i] != 0) continue;
+
+            nr_cols++;
+            node[i] = nr_cols;
+            queue.clear();
+            queue.push_back(i);
+            for (size_t q = 0; q < queue.size(); ++q) {
+                int64_t j = queue[q];
+                int64_t jz = j / nxy;
+                int64_t jy = (j % nxy) / size_x;
+                int64_t jx = j % size_x;
+                for (int64_t kz = max(jz - 1, (int64_t)0); kz <= min(jz + 1, size_z - 1); ++kz) {
+                    for (int64_t ky = max(jy - 1, (int64_t)0); ky <= min(jy + 1, size_y - 1); ++ky) {
+                        for (int64_t kx = max(jx - 1, (int64_t)0); kx <= min(jx + 1, size_x - 1); ++kx) {
+                            int64_t k = nxy * kz + size_x * ky + kx;
+                            if (node[k] == 0 && *(nii_column_data + k) == label_i) {
+                                node[k] = nr_cols;
+                                queue.push_back(k);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Voxels with both a column and a layer label take part
     auto in_cell = [&](int64_t i) {
-        return *(nii_column_data + i) > 0 && *(nii_layer_data + i) > 0;
+        return node[i] > 0 && *(nii_layer_data + i) > 0;
     };
 
-    int32_t nr_cols = 0, nr_layers = 0;
+    int32_t nr_layers = 0;
     for (int64_t i = 0; i < nr_voxels; ++i) {
-        nr_cols = max(nr_cols, *(nii_column_data + i));
         if (in_cell(i)) nr_layers = max(nr_layers, *(nii_layer_data + i));
     }
     const int64_t nr_nodes = nr_cols + 1;  // Node 0 is unused
 
-    // Cell index: column * nr_layers + (layer - 1)
+    // Cell index: node * nr_layers + (layer - 1)
     auto cell_of = [&](int64_t i) {
-        return static_cast<int64_t>(*(nii_column_data + i)) * nr_layers
+        return static_cast<int64_t>(node[i]) * nr_layers
                + *(nii_layer_data + i) - 1;
     };
     vector<int64_t> cell_count(nr_nodes * nr_layers, 0);
@@ -409,7 +458,7 @@ int main(int argc, char* argv[]) {
         for (int64_t iy = 0; iy < size_y; ++iy) {
             for (int64_t ix = 0; ix < size_x; ++ix) {
                 int64_t i = nxy * iz + size_x * iy + ix;
-                int32_t k = *(nii_column_data + i);
+                int32_t k = node[i];
                 if (k <= 0) continue;
                 // +x, +y, +z neighbours, so each face is counted one time
                 int64_t next[3] = {ix + 1 < size_x ? i + 1 : -1,
@@ -417,7 +466,7 @@ int main(int argc, char* argv[]) {
                                    iz + 1 < size_z ? i + nxy : -1};
                 for (int n = 0; n < 3; ++n) {
                     if (next[n] < 0) continue;
-                    int32_t l = *(nii_column_data + next[n]);
+                    int32_t l = node[next[n]];
                     if (l <= 0 || l == k) continue;
                     uint64_t key = static_cast<uint64_t>(min(k, l)) * nr_nodes + max(k, l);
                     face_count[key]++;
@@ -432,8 +481,9 @@ int main(int argc, char* argv[]) {
         edge_l.push_back(f.first % nr_nodes);
         edge_w.push_back(f.second);
     }
-    cout << "  There are " << nr_cols << " columns, " << nr_layers
-         << " layers and " << edge_k.size() << " pairs of touching columns." << endl;
+    cout << "  There are " << nr_cols << (nokissing ? " connected column pieces, " : " columns, ")
+         << nr_layers << " layers and " << edge_k.size()
+         << " pairs of touching columns." << endl;
 
     // ========================================================================
     // Smooth the layer profiles: one problem for each volume, or one for all

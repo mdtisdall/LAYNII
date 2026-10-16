@@ -36,9 +36,11 @@ int show_help(void) {
     "    -replace     : (Optional) Replace each voxel with its normalized\n"
     "                   cell mean (mean / norm), so the output of each column\n"
     "                   is exactly its unit-length layer profile.\n"
-    "    -NoKissing   : (Optional) Normalize each spatially connected piece\n"
+    "    -NoKissing   : (Optional) Use each spatially connected piece\n"
     "                   (26-neighborhood) of a column as its own column. Use\n"
-    "                   this when a column touches itself across sulci.\n"
+    "                   this when a column touches itself across sulci. All\n"
+    "                   voxels with the column label connect the pieces,\n"
+    "                   also voxels without a layer label.\n"
     "    -mask        : (Optional) Set voxels outside of the columns or\n"
     "                   layers to 0. Without this option they are copied\n"
     "                   unchanged.\n"
@@ -160,40 +162,25 @@ int main(int argc, char* argv[]) {
     nifti_image* nii_layer = copy_nifti_as_int32(nii3);
     int32_t* nii_layer_data = static_cast<int32_t*>(nii_layer->data);
 
-    // Voxels with both a column and a layer label take part
-    auto in_cell = [&](int64_t i) {
-        return *(nii_column_data + i) > 0 && *(nii_layer_data + i) > 0;
-    };
-
-    int32_t nr_layers = 0;
-    for (int64_t i = 0; i < nr_voxels; ++i) {
-        if (in_cell(i)) nr_layers = max(nr_layers, *(nii_layer_data + i));
-    }
-
     // ========================================================================
-    // Find the column (or connected piece) that each voxel belongs to
+    // Find the node (column, or connected piece) that each voxel belongs to
     // ========================================================================
-    vector<int32_t> col_id(nr_voxels, 0);  // 0 = not normalized
+    vector<int32_t> node(nr_voxels, 0);  // 0 = not a column
     int32_t nr_cols = 0;
-
     if (!nokissing) {
         for (int64_t i = 0; i < nr_voxels; ++i) {
-            if (in_cell(i)) {
-                col_id[i] = *(nii_column_data + i);
-                nr_cols = max(nr_cols, col_id[i]);
-            }
+            node[i] = max(*(nii_column_data + i), 0);
+            nr_cols = max(nr_cols, node[i]);
         }
-        cout << "  There are " << nr_cols << " columns and " << nr_layers
-             << " layers." << endl;
     } else {
         // Flood fill each connected piece of each column with a new id
         vector<int64_t> queue;
         for (int64_t i = 0; i < nr_voxels; ++i) {
-            if (!in_cell(i) || col_id[i] != 0) continue;
             int32_t label_i = *(nii_column_data + i);
+            if (label_i <= 0 || node[i] != 0) continue;
 
             nr_cols++;
-            col_id[i] = nr_cols;
+            node[i] = nr_cols;
             queue.clear();
             queue.push_back(i);
             for (size_t q = 0; q < queue.size(); ++q) {
@@ -205,9 +192,8 @@ int main(int argc, char* argv[]) {
                     for (int64_t ky = max(jy - 1, (int64_t)0); ky <= min(jy + 1, size_y - 1); ++ky) {
                         for (int64_t kx = max(jx - 1, (int64_t)0); kx <= min(jx + 1, size_x - 1); ++kx) {
                             int64_t k = nxy * kz + size_x * ky + kx;
-                            if (col_id[k] == 0 && in_cell(k)
-                                && *(nii_column_data + k) == label_i) {
-                                col_id[k] = nr_cols;
+                            if (node[k] == 0 && *(nii_column_data + k) == label_i) {
+                                node[k] = nr_cols;
                                 queue.push_back(k);
                             }
                         }
@@ -215,19 +201,29 @@ int main(int argc, char* argv[]) {
                 }
             }
         }
-        cout << "  There are " << nr_cols << " connected column pieces and "
-             << nr_layers << " layers." << endl;
     }
 
-    // Cell index: column id * (nr_layers + 1) + layer
+    // Voxels with both a column and a layer label take part
+    auto in_cell = [&](int64_t i) {
+        return node[i] > 0 && *(nii_layer_data + i) > 0;
+    };
+
+    int32_t nr_layers = 0;
+    for (int64_t i = 0; i < nr_voxels; ++i) {
+        if (in_cell(i)) nr_layers = max(nr_layers, *(nii_layer_data + i));
+    }
+    cout << "  There are " << nr_cols << (nokissing ? " connected column pieces and " : " columns and ")
+         << nr_layers << " layers." << endl;
+
+    // Cell index: node * (nr_layers + 1) + layer
     const int64_t nr_cells = static_cast<int64_t>(nr_cols + 1) * (nr_layers + 1);
     auto cell_of = [&](int64_t i) {
-        return static_cast<int64_t>(col_id[i]) * (nr_layers + 1) + *(nii_layer_data + i);
+        return static_cast<int64_t>(node[i]) * (nr_layers + 1) + *(nii_layer_data + i);
     };
 
     vector<int64_t> cell_count(nr_cells, 0);
     for (int64_t i = 0; i < nr_voxels; ++i) {
-        if (col_id[i] > 0) cell_count[cell_of(i)]++;
+        if (in_cell(i)) cell_count[cell_of(i)]++;
     }
 
     // ========================================================================
@@ -240,7 +236,7 @@ int main(int argc, char* argv[]) {
 
         fill(cell_mean.begin(), cell_mean.end(), 0.0);
         for (int64_t i = 0; i < nr_voxels; ++i) {
-            if (col_id[i] > 0) cell_mean[cell_of(i)] += *(data_t + i);
+            if (in_cell(i)) cell_mean[cell_of(i)] += *(data_t + i);
         }
 
         fill(col_norm.begin(), col_norm.end(), 0.0);
@@ -255,8 +251,8 @@ int main(int argc, char* argv[]) {
         }
 
         for (int64_t i = 0; i < nr_voxels; ++i) {
-            if (col_id[i] > 0) {
-                double norm = col_norm[col_id[i]];
+            if (in_cell(i)) {
+                double norm = col_norm[node[i]];
                 double val = replace ? cell_mean[cell_of(i)] : *(data_t + i);
                 *(data_t + i) = norm > 0 ? val / norm : 0;
             } else if (do_masking) {

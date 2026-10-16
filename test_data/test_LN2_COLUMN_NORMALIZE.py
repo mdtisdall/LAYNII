@@ -139,6 +139,12 @@ def test_nokissing(binary, tmp, rng):
     out = run(binary, tmp, data, columns, layers, "-NoKissing")
     check(out, expected(data, pieces, layers), "-NoKissing")
 
+    # A bridge of column 1 at x = 2..3 in z = 0, which has no layer label,
+    # connects the two blobs, so -NoKissing keeps them as one column.
+    bridged = [1 if x <= 1 or x >= 4 or z == 0 else 0 for x, y, z in coords()]
+    out = run(binary, tmp, data, bridged, layers, "-NoKissing")
+    check(out, expected(data, whole, layers), "-NoKissing with bridge")
+
 
 def test_4d(binary, tmp, rng):
     # Volume 2 = 3 x volume 1: each volume is normalized on its own.
