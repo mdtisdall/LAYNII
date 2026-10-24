@@ -15,6 +15,8 @@ int show_help(void){
     "Options:\n"
     "    -help       : show this help\n"
     "    -layer_file : nii file that contains layer or column masks \n"
+    "                  (0 = outside; negative layers, e.g. from\n"
+    "                  LN2_LAYERS -extend_wm, are smoothed like the others)\n"
     "    -input      : nii file that should be smoothed. it should have same dimensions as layer file\n"
     "    -FWHM       : the amount of smoothing in mm\n"
     "    -twodim     : optional argument to do smoothing in 2 Dim only \n"
@@ -308,17 +310,20 @@ cout << " FWHM_val " <<  FWHM_val<<  endl;
 ////Finding number of layers  /////
 ///////////////////////////////////
  int layernumber = 0 ;
+ int layernumber_min = 1 ;  // negative layers (e.g. LN2_LAYERS -extend_wm) are smoothed too; 0 is outside
 
 	for(int iz=0; iz<sizeSlice; ++iz){
   		for(int iy=0; iy<sizePhase; ++iy){
        		for(int ix=0; ix<sizeRead; ++ix){
 	 		 if (*(nim_mask_data   +  nxy*iz + nx*ix  + iy  ) > layernumber)  layernumber = *(nim_mask_data   +  nxy*iz + nx*ix  + iy) ;
+	 		 if (*(nim_mask_data   +  nxy*iz + nx*ix  + iy  ) < layernumber_min)  layernumber_min = *(nim_mask_data   +  nxy*iz + nx*ix  + iy) ;
 
       		}
    		}
    	}
 
 cout << " There are  " <<  layernumber<< " layers/masks to smooth within  " << endl;
+if (layernumber_min < 1) cout << " and " << -layernumber_min << " negative layers " << endl;
 
 
 ///////////////////////////////////
@@ -346,7 +351,8 @@ if (sulctouch == 0 ){
  cout << " smoothing in layer not considering sulci  " << flush ;
 
 
- for(int layernumber_i=1; layernumber_i<=layernumber; ++layernumber_i){
+ for(int layernumber_i=layernumber_min; layernumber_i<=layernumber; ++layernumber_i){
+ if (layernumber_i == 0) continue;
  cout << "\r  " <<  layernumber_i << " of  " << layernumber<<  flush ;
 
 	for(int iz=0; iz<sizeSlice; ++iz){
@@ -382,7 +388,7 @@ if (sulctouch == 0 ){
                 }
 	     }
 
-	     if (*(nim_mask_data   +  nxy*iz + nx*ix  + iy  )  <= 0 )	 {
+	     if (*(nim_mask_data   +  nxy*iz + nx*ix  + iy  )  == 0 )	 {
 
                 for (int time_i = 0 ; time_i < nrep ; ++time_i){
                  	*(smoothed_data +  nxyz *time_i   + nxy*iz + nx*ix  + iy  ) =  *(nim_inputf_data  +  nxyz *time_i + nxy*iz + nx*ix  + iy  ) ;
@@ -458,7 +464,7 @@ int pref_ratio = 0 ;
 	for(int iz=0; iz<sizeSlice; ++iz){
       for(int iy=0; iy<sizePhase; ++iy){
         for(int ix=0; ix<sizeRead-0; ++ix){
-	      if(*(nim_mask_data +  nxy*iz + nx*ix  + iy  )  > 0  ){
+	      if(*(nim_mask_data +  nxy*iz + nx*ix  + iy  )  != 0  ){
 	        running_index ++ ;
             if ((running_index*100)/nvoxels_to_go_across != pref_ratio ) {
          	   cout << "\r "<<(running_index*100)/nvoxels_to_go_across <<  "% " << flush ;
@@ -541,7 +547,7 @@ int pref_ratio = 0 ;
 
 	     } /// if scope  if (*(nim_mask_data +  nxy*iz + nx*ix  + iy  )  > 0  ){ closed
 	     
-	     if (*(nim_mask_data   +  nxy*iz + nx*ix  + iy  )  <= 0 )	 {
+	     if (*(nim_mask_data   +  nxy*iz + nx*ix  + iy  )  == 0 )	 {
 
                 for (int time_i = 0 ; time_i < nrep ; ++time_i){
                  	*(smoothed_data +  nxyz *time_i   + nxy*iz + nx*ix  + iy  ) =  *(nim_inputf_data  +  nxyz *time_i + nxy*iz + nx*ix  + iy  ) ;
