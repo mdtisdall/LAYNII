@@ -1,6 +1,8 @@
 
 #include "../dep/laynii_lib.h"
 #include <sstream>
+#include <vector>
+#include <algorithm>
 
 int show_help(void) {
     printf(
@@ -27,6 +29,15 @@ int show_help(void) {
     "    -incl_borders : (Optional) Include inner and outer gray matter borders\n"
     "                    into the layering. This treats the borders as \n"
     "                    a part of gray matter. Off by default.\n"
+    "    -extend_wm    : (Optional) Extend the columns this many mm into the\n"
+    "                    voxels coded 2. Each voxel coded 2 within extend_wm mm\n"
+    "                    (Euclidean) of a voxel coded 3 gets the column of the\n"
+    "                    nearest voxel coded 3 (ties: the first in z, y, x\n"
+    "                    order). This is the voxel that LN2_LAYERS -extend_wm\n"
+    "                    measures its negative layer from, so with the same\n"
+    "                    rim and distance both label the same voxels. Columns\n"
+    "                    of the voxels coded 3 do not change. Cannot be used\n"
+    "                    with -incl_borders. Off by default.\n"
     "    -output       : (Optional) Output basename for all outputs.\n"
     "\n"
     "Notes:\n"
@@ -43,6 +54,7 @@ int main(int argc, char*  argv[]) {
     int ac;
     int32_t nr_columns = 5;
     bool mode_debug = false, mode_initialize_with_centroids = false, mode_incl_borders = false;
+    float extend_wm = 0;
 
     // Process user options
     if (argc < 2) return show_help();
@@ -83,6 +95,16 @@ int main(int argc, char*  argv[]) {
             fout = argv[ac];
         } else if (!strcmp(argv[ac], "-incl_borders")) {
             mode_incl_borders = true;
+        } else if (!strcmp(argv[ac], "-extend_wm")) {
+            if (++ac >= argc) {
+                fprintf(stderr, "** missing argument for -extend_wm\n");
+                return 1;
+            }
+            extend_wm = atof(argv[ac]);
+            if (!(extend_wm > 0)) {
+                fprintf(stderr, "** -extend_wm must be a positive distance in mm\n");
+                return 1;
+            }
         } else if (!strcmp(argv[ac], "-debug")) {
             mode_debug = true;
         } else {
@@ -104,6 +126,10 @@ int main(int argc, char*  argv[]) {
             fprintf(stderr, "** missing option '-centroids'\n");
             return 1;
         }
+    }
+    if (extend_wm > 0 && mode_incl_borders) {
+        fprintf(stderr, "** -extend_wm cannot be used with -incl_borders\n");
+        return 1;
     }
 
     // Read input dataset, including data
@@ -1387,6 +1413,57 @@ int main(int argc, char*  argv[]) {
                 *(nii_columns_data + i) = *(nii_columns_data + i) + *(flood_step_data + i )  ;
             }
         }
+    }
+    // ========================================================================
+    // Extend columns into the inner border (voxels coded 2)
+    // ========================================================================
+    // Same rule as LN2_LAYERS -extend_wm: the nearest voxel coded 3 within
+    // extend_wm mm (Euclidean), ties in z, y, x order.
+    if (extend_wm > 0) {
+        cout << "\n  Start extending columns into white matter..." << endl;
+        // Neighbour offsets within extend_wm, nearest first (ties: z, y, x order)
+        struct Offset { int dx, dy, dz; float d; };
+        std::vector<Offset> offsets;
+        const int rx = floor(extend_wm / dX), ry = floor(extend_wm / dY), rz = floor(extend_wm / dZ);
+        for (int dz = -rz; dz <= rz; ++dz) {
+            for (int dy = -ry; dy <= ry; ++dy) {
+                for (int dx = -rx; dx <= rx; ++dx) {
+                    float d = sqrt((dx * dX) * (dx * dX) + (dy * dY) * (dy * dY)
+                                   + (dz * dZ) * (dz * dZ));
+                    if (d > 0 && d <= extend_wm) {
+                        offsets.push_back({dx, dy, dz, d});
+                    }
+                }
+            }
+        }
+        std::stable_sort(offsets.begin(), offsets.end(),
+                         [](const Offset& a, const Offset& b) { return a.d < b.d; });
+
+        // Read the columns of the voxels coded 3 only, so the order of the
+        // loop does not matter
+        std::vector<int32_t> wm_column(nr_voxels, 0);
+        uint32_t nr_extended = 0;
+        for (uint32_t i = 0; i != nr_voxels; ++i) {
+            if (*(nii_rim_data + i) != 2) continue;
+            uint32_t ix, iy, iz;
+            tie(ix, iy, iz) = ind2sub_3D(i, size_x, size_y);
+            for (const Offset& o : offsets) {
+                int64_t jx = static_cast<int64_t>(ix) + o.dx;
+                int64_t jy = static_cast<int64_t>(iy) + o.dy;
+                int64_t jz = static_cast<int64_t>(iz) + o.dz;
+                if (jx < 0 || jy < 0 || jz < 0 || jx > end_x || jy > end_y || jz > end_z) continue;
+                uint32_t j = sub2ind_3D(jx, jy, jz, size_x, size_y);
+                if (*(nii_rim_data + j) == 3) {
+                    wm_column[i] = *(nii_columns_data + j);
+                    if (wm_column[i] != 0) nr_extended++;
+                    break;
+                }
+            }
+        }
+        for (uint32_t i = 0; i != nr_voxels; ++i) {
+            if (wm_column[i] != 0) *(nii_columns_data + i) = wm_column[i];
+        }
+        cout << "    Voxels added below the inner border: " << nr_extended << endl;
     }
     // ========================================================================
     save_output_nifti(fout, "columns" + tag.str(), nii_columns, true);
