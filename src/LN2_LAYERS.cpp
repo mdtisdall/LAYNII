@@ -51,6 +51,21 @@ int show_help(void) {
     "                    This option inherently includes the borders.\n"
     "                    output is given with file name addition `*layers_equicount*.\n"
     "                    Useful for ~0.8 mm inputs where no upsampling is done.\n"
+    "    -extend_wm    : (Optional) Extend the layers this many mm into the\n"
+    "                    voxels coded 2, with negative layer numbers. A voxel\n"
+    "                    coded 2 at Euclidean distance x <= extend_wm from the\n"
+    "                    nearest voxel coded 3 gets layer -ceil(nr_layers * x / T)\n"
+    "                    and metric -x / T, where T is the inner + outer\n"
+    "                    distance of that voxel coded 3 (before smoothing).\n"
+    "                    So the layers below the border have the same relative\n"
+    "                    thickness as the equi-distant layers above it; the\n"
+    "                    equi-volume outputs get the same values. Each voxel is\n"
+    "                    measured from its nearest voxel coded 3 only (ties:\n"
+    "                    the first in z, y, x order; skipped if that voxel was\n"
+    "                    not reached from both borders). Layers and metrics of the\n"
+    "                    voxels coded 3 do not change. Useful when the rim codes\n"
+    "                    all white matter as 2 (e.g. from LN2_RIMIFY). Cannot be\n"
+    "                    used with -incl_borders. Off by default.\n"
     "    -no_smooth    : (Optional) Disable smoothing on cortical depth metric.\n"
     "    -debug        : (Optional) Save extra intermediate outputs.\n"
     "    -output       : (Optional) Output basename for all outputs.\n"
@@ -73,6 +88,7 @@ int main(int argc, char*  argv[]) {
     bool mode_equivol = false, mode_debug = false, mode_incl_borders = false;
     bool mode_curvature =false, mode_streamlines = false, mode_smooth = true;
     bool mode_thickness = false, mode_equal_counts = false;
+    float extend_wm = 0;
 
     // Process user options
     if (argc < 2) return show_help();
@@ -116,6 +132,16 @@ int main(int argc, char*  argv[]) {
             mode_incl_borders = true;
         } else if (!strcmp(argv[ac], "-equal_counts")) {
             mode_equal_counts = true;
+        } else if (!strcmp(argv[ac], "-extend_wm")) {
+            if (++ac >= argc) {
+                fprintf(stderr, "** missing argument for -extend_wm\n");
+                return 1;
+            }
+            extend_wm = atof(argv[ac]);
+            if (!(extend_wm > 0)) {
+                fprintf(stderr, "** -extend_wm must be a positive distance in mm\n");
+                return 1;
+            }
         } else if (!strcmp(argv[ac], "-no_smooth")) {
             mode_smooth = false;
         } else if (!strcmp(argv[ac], "-debug")) {
@@ -128,6 +154,10 @@ int main(int argc, char*  argv[]) {
 
     if (!fin) {
         fprintf(stderr, "** missing option '-rim'\n");
+        return 1;
+    }
+    if (extend_wm > 0 && mode_incl_borders) {
+        fprintf(stderr, "** -extend_wm cannot be used with -incl_borders\n");
         return 1;
     }
 
@@ -1186,6 +1216,68 @@ int main(int argc, char*  argv[]) {
     }
 
     // ------------------------------------------------------------------------
+    // Extend layers into the inner border (voxels coded 2)
+    // ------------------------------------------------------------------------
+    // Depth -x / T of each voxel coded 2 within extend_wm mm of a voxel coded 3,
+    // where x is the Euclidean distance to the nearest voxel coded 3 and T the
+    // inner + outer distance of that voxel. Written into the outputs just
+    // before they are saved, and reset after, so nothing else sees it.
+    std::vector<uint32_t> wm_ext_id;
+    std::vector<float> wm_ext_depth;
+    if (extend_wm > 0) {
+        cout << "\n  Start extending layers into white matter..." << endl;
+        // Neighbour offsets within extend_wm, nearest first (ties: z, y, x order)
+        struct Offset { int dx, dy, dz; float d; };
+        std::vector<Offset> offsets;
+        const int rx = floor(extend_wm / dX), ry = floor(extend_wm / dY), rz = floor(extend_wm / dZ);
+        for (int dz = -rz; dz <= rz; ++dz) {
+            for (int dy = -ry; dy <= ry; ++dy) {
+                for (int dx = -rx; dx <= rx; ++dx) {
+                    float d = sqrt((dx * dX) * (dx * dX) + (dy * dY) * (dy * dY)
+                                   + (dz * dZ) * (dz * dZ));
+                    if (d > 0 && d <= extend_wm) {
+                        offsets.push_back({dx, dy, dz, d});
+                    }
+                }
+            }
+        }
+        std::stable_sort(offsets.begin(), offsets.end(),
+                         [](const Offset& a, const Offset& b) { return a.d < b.d; });
+
+        for (uint32_t ii = 0; ii != nr_voi; ++ii) {
+            uint32_t i = *(voi_id + ii);
+            if (*(nii_rim_data + i) != 2) continue;
+            tie(ix, iy, iz) = ind2sub_3D(i, size_x, size_y);
+            for (const Offset& o : offsets) {
+                int64_t jx = static_cast<int64_t>(ix) + o.dx;
+                int64_t jy = static_cast<int64_t>(iy) + o.dy;
+                int64_t jz = static_cast<int64_t>(iz) + o.dz;
+                if (jx < 0 || jy < 0 || jz < 0 || jx > end_x || jy > end_y || jz > end_z) continue;
+                j = sub2ind_3D(jx, jy, jz, size_x, size_y);
+                if (*(nii_rim_data + j) == 3) {
+                    // Skipped if that voxel was not reached by both growths
+                    if (*(innerGM_dist_data + j) > 0 && *(outerGM_dist_data + j) > 0) {
+                        float total_dist = *(innerGM_dist_data + j) + *(outerGM_dist_data + j);
+                        wm_ext_id.push_back(i);
+                        wm_ext_depth.push_back(-o.d / total_dist);
+                    }
+                    break;
+                }
+            }
+        }
+        cout << "    Voxels added below the inner border: " << wm_ext_id.size() << endl;
+    }
+    // Put the extension into a layers and a metric image (set) or remove it
+    auto apply_wm_ext = [&](float* metric_data, bool set) {
+        for (size_t k = 0; k != wm_ext_id.size(); ++k) {
+            uint32_t i = wm_ext_id[k];
+            float depth = wm_ext_depth[k];
+            *(nii_layers_data + i) = set ? -ceil(-depth * nr_layers) : 0;
+            *(metric_data + i) = set ? depth : 0;
+        }
+    };
+
+    // ------------------------------------------------------------------------
     // Handle include borders type
     // ------------------------------------------------------------------------
     for (uint32_t ii = 0; ii != nr_voi; ++ii) {
@@ -1207,8 +1299,10 @@ int main(int argc, char*  argv[]) {
     }
     // ------------------------------------------------------------------------
     cout << "\n  Saving equidistant metric and layers files..." << endl;
+    apply_wm_ext(normdist_data, true);
     save_output_nifti(fout, "metric_equidist", normdist);
     save_output_nifti(fout, "layers_equidist", nii_layers, true);
+    apply_wm_ext(normdist_data, false);
 
     if (mode_debug) {
         save_output_nifti(fout, "hotspots", hotspots, false);
@@ -1623,8 +1717,10 @@ int main(int argc, char*  argv[]) {
         }
         // --------------------------------------------------------------------
         cout << "\n  Saving equivolume metric and layers files..." << endl;
+        apply_wm_ext(normdistdiff_data, true);
         save_output_nifti(fout, "metric_equivol", normdistdiff);
         save_output_nifti(fout, "layers_equivol", nii_layers);
+        apply_wm_ext(normdistdiff_data, false);
 
         // ====================================================================
         // Middle gray matter for equi-volume
