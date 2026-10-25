@@ -1,6 +1,6 @@
 # Plan: laminar refinement filter (working name `layer_refine`)
 
-Planning file for branch `docs/layer-refine-plan`. The first version is a
+Planning file for the laminar refinement filter. The first version is a
 Python prototype in the ex vivo example project (`example/`, a separate
 repository with its own flake). A LayNii C++ port (working name
 `LN2_LAYER_REFINE`) follows when the method and its weights are settled; the
@@ -19,7 +19,9 @@ for 100 µm ex vivo data. It balances three pressures:
    keeps both its areal borders and its laminar transitions.
 3. **Nudged layers.** Each column's layer boundaries move so that layers are
    homogeneous inside and distinct from their neighbours, pooled over each
-   region.
+   region. The layers are **contrast bands**: each region gets only as many
+   as its laminar contrast supports (K_R, usually well below 13), chosen by
+   cross-validation.
 
 The regions are estimated together with the layers, by merging columns.
 Laminar contrast is normalized per column, over small units, whatever the
@@ -36,7 +38,9 @@ Input, per patch (V1V2, PCC_SPL, M1S1 of `pipeline_L25_L13_wm`):
 - Continuous depth m(v): the equivolume metric of `LN2_LAYERS`, in [0, 1]
   in the cortex (0 = WM border) and −x/T in the extended WM. The pipeline
   does not crop it yet (step 0 below).
-- Geometric layers: the 25- or 13-layer equivolume bins.
+- Geometric layers: the 25- or 13-layer equivolume bins. With adaptive
+  bands they are only the fixed-K baseline (see Evaluation); the bands are
+  fitted on the continuous depth m.
 
 Measured on the patches (columns at least 2 voxels from the crop faces):
 
@@ -53,14 +57,21 @@ one voxel thick (V1V2: about 2,000 voxels, against 37,000 in layer 2), layer
 
 Terms:
 
-- *Region* R: a connected set of columns. *Template* μ_R: the region's
-  layer profile (one value for each layer), zero mean and unit norm over the
-  region's common layers.
-- *Common layers* of a region: the layers that at least `p_common` (default
-  0.8) of its columns have.
-- *Boundaries* z_c = (z_c,1 < … < z_c,K−1): the depths, on the m axis, that
-  separate the K layers of column c. Layer of voxel v: k_c(v) = the number of
-  boundaries below m(v), plus 1.
+- *Region* R: a connected set of columns.
+- *Band*: a layer of the refined layering, a depth interval of nearly
+  constant normalized intensity. Region R has K_R bands; neighbouring regions
+  can have different K_R.
+- *Template* μ_R: the region's band profile (one value for each band), zero
+  mean and unit norm over the region's common bands.
+- *Common bands* of a region: the bands that at least `p_common` (default
+  0.8) of its columns have voxels in.
+- *Boundaries* z_c = (z_c,1 < … < z_c,K−1), K = K_R: the depths, on the m
+  axis, that separate the bands of column c. Band of voxel v: k_c(v) = the
+  number of boundaries below m(v), plus 1.
+- *Region boundaries* Z_R = (Z_R,1 < … < Z_R,K−1): the band boundaries of the
+  region's pooled profile (step 3b), in relative depth.
+- *Depth grid*: G fine depth bins of width h (default 1/50 of the local
+  thickness) on the m axis, from the deepest WM depth to the pial cut.
 
 ## Model
 
@@ -78,35 +89,45 @@ Energy, for a fixed partition into regions:
     E = Σ_c Σ_{v ∈ c} (f(v) − a_c − s_c μ_R(k_c(v)))² / σ_c²           data (pressure 3)
       + κ Σ_{c~c'} w_cc' [(a_c − a_c')² + (s_c − s_c')²] / σ²             gain/offset field
       + λ_z Σ_k Σ_{c~c'} w_cc' |z_c,k − z_c',k|                           TV on boundaries (pressure 1)
-      + η Σ_c Σ_k (z_c,k − z⁰_c,k)²                                       pull to geometry
-      s.t. z_c,k+1 − z_c,k ≥ t_min · (z⁰_c,k+1 − z⁰_c,k)                  minimum thickness
+      + η Σ_c Σ_k (z_c,k − Z_R,k)²                                        pull to the region's bands
+      s.t. z_c,k+1 − z_c,k ≥ t_min                                        minimum band thickness
 
 σ_c is the noise level of column c, from the variance inside its cells; it
-makes the data term dimensionless. z⁰ are the geometric (equivolume)
-boundaries. Minimizing the within-layer residual is the same as maximizing
+makes the data term dimensionless. Z_R are the region's band boundaries
+(step 3b), at the same relative depth in each column; at the first re-fit,
+before any bands exist, they are the geometric boundaries of the fixed-K
+baseline. Minimizing the within-band residual is the same as maximizing
 the between-layer / within-layer (Fisher, Otsu) ratio for the fixed total
 variance, so this is pressure 3. It is scored on the raw data, not on the
 filtered u, so the TV on u cannot make the layers look homogeneous.
 
 TV on the intensity (pressure 1) is a separate step on the normalized cell
-means x̂_c,k = (cell mean − a_c) / s_c in the nudged layers:
+means x̂_c,k = (cell mean − a_c) / s_c in the nudged bands. Two columns of
+different regions can have different bands, so the TV compares profiles on
+the common depth grid: each column's band values are written to the grid
+bins it covers (piecewise constant), and
 
     min_u  ½ Σ_c,k n_c,k (u_c,k − x̂_c,k)²
-         + λ_g Σ_{c~c'} w_cc' ||u_c − u_c'||₂          group term (as LN2_COLUMN_SMOOTH_TV_NORM)
-         + λ_l Σ_k Σ_{c~c'} w_cc' |u_c,k − u_c',k|      per-layer term
+         + λ_g Σ_{c~c'} w_cc' ||P_c u_c − P_c' u_c'||₂          group term (as LN2_COLUMN_SMOOTH_TV_NORM)
+         + λ_l Σ_g Σ_{c~c'} w_cc' |(P_c u_c)_g − (P_c' u_c')_g|  per-depth term
 
-over the cells where both columns have voxels. λ_l = 0 is the group form;
-λ_l > 0 the group + per-layer form. The two are compared (see Evaluation).
+where P_c maps column c's band values to the grid bins (weighted by bin
+width, so the scale does not depend on h), over the bins where both columns
+have voxels. Inside a region with equal bands this is the plain band TV.
+λ_l = 0 is the group form; λ_l > 0 the group + per-depth form. The two are
+compared (see Evaluation).
 
 ## Solver
 
 ### 0. Data preparation (pipeline change)
 
-- Crop `metric_equivol` (float32) for each patch, next to the bins.
-- Merge sparse edge layers: a geometric layer with fewer voxels than
-  `f_sparse` (default 0.25) × the median layer count in the patch is merged
-  into its inner neighbour. For 25 bins this merges 1 into 2 and 24, 25
-  into 23; for 13 bins, 13 into 12.
+- Crop `metric_equivol` (float32) for each patch, next to the bins. It holds
+  the continuous depth in the cortex and −x/T in the extended WM.
+- For the fixed-K baseline only: merge sparse edge layers. A geometric
+  layer with fewer voxels than `f_sparse` (default 0.25) × the median layer
+  count in the patch is merged into its inner neighbour. For 25 bins this
+  merges 1 into 2 and 24, 25 into 23; for 13 bins, 13 into 12. The adaptive
+  bands work on the depth grid and need no such rule.
 
 ### 1. Regions: agglomerative merging
 
@@ -118,11 +139,13 @@ The merge loop is the outer loop; it gives the full hierarchy.
    column graph as connectivity), using the current gain/offset and
    boundaries.
 3. Merge the cheapest pair; update the costs of its neighbours.
-4. **Re-fit levels.** A full re-fit (steps 2–4 below) after each merge is too
+4. **Re-fit levels.** A full re-fit (steps 2–5 below) after each merge is too
    expensive. The re-fit runs at the levels where the number of regions
    reaches N₀ / 2^j (and at 2, 3, 4, 5 regions), and the merge costs are then
-   recomputed. Before the first re-fit, the boundaries are geometric and the
-   gain/offset is the per-column mean and RMS.
+   recomputed. Before the first re-fit, the boundaries are geometric (the
+   fixed-K baseline) and the gain/offset is the per-column mean and RMS.
+   Each re-fit chooses K_R again for every region (step 3b), so a merged
+   region can have more or fewer bands than its parts.
 5. Stop at one region. Nothing chooses a level: the output is the merge tree
    plus the full results at each re-fit level.
 
@@ -134,38 +157,68 @@ independent per-column least squares.
 
 ### 3. Templates (fixed gain/offset, boundaries)
 
-μ_R,k = Σ s_c (f(v) − a_c) / Σ s_c², over the voxels of region R in layer k.
-Then centre and scale μ_R to zero mean and unit norm over the common layers,
+μ_R,k = Σ s_c (f(v) − a_c) / Σ s_c², over the voxels of region R in band k.
+Then centre and scale μ_R to zero mean and unit norm over the common bands,
 and change a_c and s_c to match, so the model is unchanged.
+
+### 3b. Bands of each region (fixed gain/offset)
+
+For each region, an optimal segmentation of its pooled profile on the depth
+grid, in relative depth (each column's own m), with the normalized voxels
+x̂(v) = (f(v) − a_c) / s_c:
+
+1. For each grid bin g: Σ x̂, Σ x̂² and the voxel count, over the region's
+   voxels in the bin. Prefix sums give the residual of any interval in O(1).
+2. Dynamic programming (Bellman segmentation): for each K = 1..K_max
+   (default 8), the K-band split of the grid with the least within-band
+   residual, with each band at least t_min wide. One pass gives every K;
+   O(K_max · G²) per region. The split for K need not be a refinement of
+   the split for K − 1.
+3. **Choose K by cross-validation.** Split the region's columns into two
+   halves A and B at random (fixed seed); the halves share no voxels. Fit
+   the split for each K on A; on B, re-fit each column's gain and offset to
+   A's template (2 parameters per column) and measure the residual; swap A
+   and B and add. K_R is the K with the least held-out residual.
+4. Z_R = the best split for K_R on all columns.
+
+Each column's boundaries are then nudged around Z_R in step 4. A region
+with K_R = 1 has no boundaries (no laminar contrast that generalizes).
 
 ### 4. Boundaries: optimal surfaces (fixed gain/offset, templates)
 
-Exact min-cut for the K−1 surfaces of all columns together (Li, Wu, Chen &
+Exact min-cut for the K_R−1 surfaces of all columns together (Li, Wu, Chen &
 Sonka 2006; Ishikawa 2003). The data term splits into one term for each
 surface: with e_k(v) = (f(v) − a_c − s_c μ_R,k)² / σ_c²,
 
     Σ_v e_{k_c(v)}(v) = Σ_v e_1(v) + Σ_k Σ_{v : m(v) ≥ z_c,k} (e_k+1(v) − e_k(v)),
 
 so the cost of surface k at depth d in column c is a cumulative sum over the
-column's voxels sorted by depth. The prior η(z − z⁰)² is a unary term;
+column's voxels sorted by depth. The prior η(z − Z_R)² is a unary term;
 TV on z is a convex pairwise term between columns; the minimum thickness is
 a hard constraint between neighbouring surfaces of one column. All of these
 fit the construction, so the cut gives the global optimum of this step.
 
-TV edges between columns of different regions have weight ρ λ_z (default
-ρ = 0), so boundaries can jump at a region border.
+TV edges between columns of different regions have weight 0: their bands
+need not correspond (K_R can differ), and boundaries can jump at a region
+border. Each region is then its own min-cut problem.
 
-**Coarse to fine.** The graph has columns × depth samples × surfaces nodes
-(V1V2 at full resolution: about 4,500 × 250 × 24 = 27 million). First solve
-with the 13-layer bins and a depth step of 1/50 of the thickness; then
-solve the full layer count in a band of ± one coarse layer around the
-coarse result, with a step of 1/200.
+**Coarse to fine.** The graph has columns × depth samples × surfaces nodes.
+With fixed layers this is large (V1V2 with 24 surfaces at full resolution:
+about 4,500 × 250 × 24 = 27 million); with bands it has only K_R − 1
+surfaces per region, which is much smaller. The coarse level is the
+region's DP split Z_R on the depth grid (step 3b); the fine level is the
+min-cut in a band of ± `w_band` (default half of the narrowest band of the
+region) around Z_R, with a depth step of 1/200 of the thickness. The
+fixed-K baseline uses the same two levels, with the 13-layer bins as the
+coarse level.
 
 ### 5. Bottom (pressure 2), for each region at each re-fit level
 
-The profiles are extended into the WM layers −1, −2, … (normalized with
-the column's own a_c, s_c). For each candidate bottom b (the WM layers down
-to b included):
+The profiles are extended into the WM, in steps of one depth-grid bin
+(normalized with the column's own a_c, s_c). The WM part of the profile is
+segmented with the same DP as step 3b, continuing the region's bands, so
+a band can also reach below the GM/WM border. For each candidate bottom b
+(the WM depth down to b included):
 
 - **Test A, areal border.** For each neighbouring region R', over the
   columns within `D` (default 2 column widths) of the R–R' border: the
@@ -176,16 +229,16 @@ to b included):
   columns that the extended template explains. It fails when it drops by
   more than `δ_B` (default 0.1) from its value with no WM layers.
 
-b_R is the deepest b for which every layer from 0 to b passes both tests.
-Only columns that have WM layers down to b vote; columns without WM layers
+b_R is the deepest b for which every depth from 0 to b passes both tests.
+Only columns that have WM voxels down to b vote; columns without WM voxels
 take their region's b_R.
 
 ### 6. Intensity TV (for each output level)
 
 Chambolle–Pock with diagonal preconditioning and adaptive steps, as in
-`LN2_COLUMN_SMOOTH_TV_NORM`, with the per-layer term added (its prox is
-soft thresholding of each entry of the dual). u does not feed back into
-steps 1–5.
+`LN2_COLUMN_SMOOTH_TV_NORM`, with the per-depth term added (its dual prox is
+a clip of each entry) and the grid maps P_c in the difference operator.
+u does not feed back into steps 1–5.
 
 ## Weights (normalized units)
 
@@ -195,7 +248,9 @@ steps 1–5.
 | λ_z (TV on z) | per shared face, z in fractions of local thickness | sweep |
 | η (pull to geometry) | per column, z in fractions of local thickness | sweep |
 | κ (gain/offset smoothness) | per shared face, a and s relative to σ | sweep |
-| t_min | fraction of the geometric layer thickness | 0.3 |
+| t_min (minimum band thickness) | fraction of local thickness | 0.05 |
+| K_max | bands | 8 |
+| h (depth grid) | fraction of local thickness | 1/50 |
 | δ_A, δ_B | relative drop | 0.1 |
 | p_common, f_sparse | fractions | 0.8, 0.25 |
 
@@ -203,8 +258,10 @@ steps 1–5.
 
 - Merge tree (parent, cost, size for each merge), and per re-fit level:
   - region labels (column and voxel images);
-  - nudged layer labels and the continuous boundaries z_c (one value per
-    column and boundary, CSV, and a nudged layer image);
+  - K_R, Z_R and the cross-validated residual for each K = 1..K_max, per
+    region (CSV);
+  - band labels and the continuous boundaries z_c (one value per column and
+    boundary, CSV, and a band image);
   - gain and offset per column;
   - bottom b_R per region, and a bottom-depth image;
   - filtered image: each voxel shifted by the change of its cell mean, as
@@ -222,7 +279,16 @@ at the level nearest to the earlier k = 2 split:
   (data term / total variance), and, in V1V2, whether the stria of Gennari
   stays inside its layers: the width (in layers) of the stria's dip in the
   V1 template and in u, against the unfiltered profile.
-- Whether the nudge helps: the same measures with η → ∞ (geometric layers).
+- Whether the nudge helps: the same measures with η → ∞ (no nudge).
+- **Fixed against adaptive layers.** The whole filter with fixed geometric
+  layers (13 bins, and 25 bins with the sparse edge layers merged) against
+  adaptive bands, on all the measures above.
+- **Bands per region.** Maps of K_R and Z_R per region, and the
+  cross-validated residual against K for each region: for example, whether
+  V1 needs more bands (the stria) than V2.
+- **Band stability.** Whether the band boundaries agree between the two
+  cross-validation halves (the distance between Z_R fitted on A and on B),
+  and between neighbouring re-fit levels of the region hierarchy.
 
 ## Correctness tests (prototype)
 
@@ -237,6 +303,9 @@ at the level nearest to the earlier k = 2 split:
    Ward clustering with the same connectivity.
 5. A column copied with a gain and an offset gets the same boundaries and
    template.
+6. Band DP against brute force on a short grid (G = 12, K ≤ 4), and on a
+   synthetic piecewise-constant profile with noise: cross-validation finds
+   the true K and the boundaries within one grid bin.
 
 ## Prototype layout and dependencies
 
@@ -259,19 +328,26 @@ example flake).
 | Regions | Estimated jointly, by merging columns; the full hierarchy is the output. |
 | Normalization | Smooth per-column gain/offset field against the region template; shape only. |
 | Nudge | Per column, with TV smoothness across columns and a pull to geometry. |
-| TV | On the intensity and on the boundary depths. Intensity TV: compare group norm against group + per-layer. |
+| TV | On the intensity and on the boundary depths. Intensity TV: compare group norm against group + per-depth. |
 | Bottom tests | Relative drop. |
-| Size | Coarse to fine. |
-| Edge layers | Merged into their neighbours. |
+| Number of layers | Adaptive contrast bands: K_R per region, from an optimal split (DP) of the region's pooled profile, K chosen by cross-validation. Neighbouring regions can differ in K_R; the TV on u compares them on a common depth grid; K_R is chosen again at each re-fit level. |
+| Size | Coarse to fine: the region's band split, then the min-cut in a band around it. |
+| Edge layers | Merged into their neighbours (fixed-K baseline only). |
 | Weights | Normalized units. |
-| Evaluation | Existing measures plus laminar ones. |
+| Evaluation | Existing measures plus laminar ones; fixed against adaptive layers, K_R maps and residual-vs-K curves, band stability. |
 | Implementation | Python prototype in `example/`; LayNii C++ port when settled. |
 
 ## Choices made in this plan (not yet confirmed)
 
 - u does not feed back into the regions, boundaries or bottom.
 - Re-fit only at the levels N₀ / 2^j and 2–5 regions; Ward costs in between.
-- TV on z is cut at region borders (ρ = 0); the gain/offset field is not.
+- TV on z is cut at region borders; the gain/offset field is not.
 - The tests A and B and their defaults (D, δ_A, δ_B).
-- The coarse-to-fine schedule and depth steps.
-- The sparse-layer rule (f_sparse) and the common-layer rule (p_common).
+- The coarse-to-fine schedule and depth steps (h, w_band, the 1/200 step).
+- The sparse-layer rule (f_sparse) and the common-band rule (p_common).
+- The band DP works in relative depth (each column's own m), so a band
+  boundary sits at the same fraction of thickness in every column before
+  the nudge.
+- The cross-validation split into random halves of columns, with the held-out
+  columns' gain and offset re-fitted to the training template; K_max = 8;
+  t_min = 0.05.
