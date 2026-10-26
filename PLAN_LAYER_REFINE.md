@@ -27,6 +27,13 @@ The regions are estimated together with the layers, by merging columns.
 Laminar contrast is normalized per column, over small units, whatever the
 size of the region.
 
+The pial surface and the seams in fused (kissing) cortex are estimated in the
+same model (see **Joint surfaces**). The layers need the surfaces, and the
+surfaces in fused cortex need the laminar contrast, so neither is an input to
+the other: the fluid above the cortex is one more band, and an outer loop
+alternates between the model and the geometry. The white surface is fixed. It
+anchors the columns and the depth frame.
+
 ## Data and terms
 
 Input, per patch (V1V2, PCC_SPL, M1S1 of `pipeline_L25_L13_wm`):
@@ -116,6 +123,123 @@ width, so the scale does not depend on h), over the bins where both columns
 have voxels. Inside a region with equal bands this is the plain band TV.
 λ_l = 0 is the group form; λ_l > 0 the group + per-depth form. The two are
 compared (see Evaluation).
+
+## Joint surfaces
+
+The model above needs the depth of each voxel, so it needs the pial surface.
+In fused (kissing) cortex the segmentation joins two banks into one block, and
+the pial surface between them is the hard part: there, the image alone is
+often not enough, but the laminar contrast of each bank is. So the pial
+surface and the seams are unknowns of the same model, and an outer loop
+alternates between the model (steps 1–5) and the geometry (step 7).
+
+### Data: three echoes
+
+Each voxel has a vector x(v) of the three FLASH echo magnitudes (TE 9.37,
+20.71, 32.05 ms; the echoes are in register with the FLASH, which is echo 2).
+The model becomes
+
+    x(v) = a_c + s_c ⊙ μ_R(k_c(v)) + noise,    noise ~ N(0, Σ_c)
+
+with a per-echo offset a_c and gain s_c (vectors of 3), vector templates
+μ_R,k, and a 3 × 3 noise covariance Σ_c from the residuals inside the cells.
+The data term is the Mahalanobis form of the scalar one. The gain/offset
+field and the templates are fitted per echo as in steps 2 and 3. The merge
+costs (step 1) and the band DP (step 3b) use the same Mahalanobis residual:
+the prefix sums hold Σ x̂ and Σ x̂ x̂ᵀ for each grid bin.
+
+Measured on V1V2 (signal over the cortex median, by echo):
+
+| Voxels | Echo 1 | Echo 2 | Echo 3 |
+|---|---|---|---|
+| Collapsed sulcus lines (512 voxels) | 0.20 | 0.23 | 0.31 |
+| Stria-like dark band | 0.81 | 0.77 | 0.74 |
+| Ordinary cortex | 1.12 | 1.17 | 1.25 |
+
+Fluid is dim at every echo. The stria is tissue with a faster decay. The
+vector keeps the two apart; one echo shows only a difference of level.
+
+### Fluid band
+
+Every column has one more band above its cortical bands: the fluid band F
+(Fomblin or CSF, in an open sulcus, outside the specimen and in a seam). Its
+template μ_F is one vector for the whole patch, not one per region, and it is
+not scaled by the column gain: fluid has no tissue gain. μ_F and its
+covariance come from the outside label farther than 0.5 mm from tissue. The
+pial surface of a column is the boundary between its top cortical band and F.
+
+### Columns and depth frame
+
+The frame depends only on the fixed white surface, so it does not change in
+the loop:
+
+- **Domain.** Cortex, seams and the fluid inside the crop (rim labels 3 and
+  1), without missing tissue.
+- **Distance.** D(v), the distance from the white surface (mm), along paths in
+  the domain (not through the WM).
+- **Streamlines.** From each white-mesh vertex, along the gradient of D
+  (smoothed by 1 voxel), outward. A streamline stops at the ridge of D (where
+  streamlines from facing banks meet: in fused cortex, the medial surface
+  between the two banks), at missing tissue, at the crop faces, or at
+  D = D_max (default 4 mm, about twice the thickest cortex).
+- **Columns.** Patches of white-mesh vertices about 0.7 mm across. Each voxel
+  goes to the column of the nearest streamline that reaches it, so each voxel
+  is in one column. These columns replace `LN2_COLUMNS`, which needs the rim
+  and so depends on the pial surface.
+- **Depth.** d(v): the distance along the voxel's streamline (mm). Relative
+  depth r(v) = d(v) / T_c, where T_c is the column's current thickness (the
+  depth of its pial surface). The data term and the geometry use d; the band
+  DP (step 3b), the pull to Z_R, the TV on z and t_min use r. Only T_c changes
+  in the loop.
+
+r is equidistant in the first version. An equivolume correction of r is a
+later option.
+
+### 7. Geometry (fixed regions, templates, gain/offset, bands)
+
+Unknowns: the tissue/fluid label of each voxel of the domain (this gives the
+pial surface and the seams), then T_c.
+
+1. **Voxel costs from the model.** For voxel v in column c:
+   - L_F(v) = ½ (x(v) − μ_F)ᵀ Σ_F⁻¹ (x(v) − μ_F): the cost of fluid;
+   - L_T(v) = the same for the column's band at r(v) (the top band for
+     r(v) ≥ Z_R,K−1), with the column's gain and offset: the cost of tissue;
+   - Λ(v) = L_T(v) − L_F(v): positive where v looks like fluid.
+2. **Fluid against tissue** (`topo_grow.grow_competing`, with Λ in place of
+   the darkness measure). Tissue grows from the WM and joins only through
+   simple points, so it keeps the topology of the WM. Fluid flows in from the
+   outside. Per mm, fluid is cheap where Λ is high and tissue is expensive
+   there; one weight β (sweep) sets how strongly Λ acts. A smooth-thickness
+   prior adds γ · max(0, d(v) − T̂_c) to the tissue cost, where T̂_c is the
+   thickness of the column's neighbours from the previous iteration (with the
+   TV of step 4). Where two banks touch with no fluid between them, topology
+   forces a cut, and the cut goes to the fluid: the seam.
+3. **Cut placement.** Thin the cuts (`thin_seam`), then move each cut onto
+   the cheapest separating surface near it (`mincut_seam`), with Λ as the
+   voxel cost in place of the darkness.
+4. **Well-composed tissue** (`wellcomposed.repair`), so that the meshes have
+   the topology of the voxels.
+5. **Thickness.** T_c = the median, over the column's streamlines, of the
+   depth of the last tissue voxel.
+
+Step 2 is a growth, not the minimum of an energy, so the outer loop does not
+always lower E. The loop records E after each step.
+
+### Outer loop
+
+0. Start from the geometric surfaces of the current pipeline (`grow_pial.py`
+   with the echo-2 darkness, then the white surface and T_c).
+1. Steps 1–5 of the model, in the fixed frame.
+2. Step 7, with the regions of the finest re-fit level whose regions all have
+   at least N_geo columns (default 50), so that each template is pooled over
+   many columns.
+3. Repeat from 1 until fewer than n_stop voxels (default 0.1 % of the cortex)
+   change label, or for it_max iterations (default 5).
+
+The templates are pooled over many columns, so the columns with a clear pial
+surface set them, and the fused columns are fitted to them. In a fused
+stretch with no visible line, the cut then goes where both banks' profiles
+end, not to the midpoint between the WM surfaces.
 
 ## Solver
 
@@ -253,6 +377,11 @@ u does not feed back into steps 1–5.
 | h (depth grid) | fraction of local thickness | 1/50 |
 | δ_A, δ_B | relative drop | 0.1 |
 | p_common, f_sparse | fractions | 0.8, 0.25 |
+| β (Λ in the growth) | per unit of Λ | sweep |
+| γ (thickness prior in the growth) | per mm beyond T̂_c | sweep |
+| D_max (streamline length) | mm | 4 |
+| N_geo (columns per region for step 7) | columns | 50 |
+| n_stop, it_max (outer loop) | voxels, iterations | 0.1 % of cortex, 5 |
 
 ## Outputs (per patch)
 
@@ -267,6 +396,9 @@ u does not feed back into steps 1–5.
   - filtered image: each voxel shifted by the change of its cell mean, as
     the TV_NORM default (u in normalized units).
 - A JSON with parameters, energies per term and solver statistics.
+- Joint surfaces, per outer iteration: the tissue/fluid labels, the seam,
+  T_c per column (CSV), the pial mesh (RAS, for ITK-SNAP), Λ as an image, and
+  E after each step.
 
 ## Evaluation
 
@@ -286,6 +418,10 @@ at the level nearest to the earlier k = 2 split:
 - **Bands per region.** Maps of K_R and Z_R per region, and the
   cross-validated residual against K for each region: for example, whether
   V1 needs more bands (the stria) than V2.
+- **Joint surfaces.** On V1V2, at (69, 65, 69), (68, 60, 71), (81, 49, 162)
+  and (61, 94, 78): the seams and the pial surface after each outer
+  iteration, against the geometric start. The digital handles of the pial
+  solid against those of the WM (16 on V1V2), and the meshes in ITK-SNAP.
 - **Band stability.** Whether the band boundaries agree between the two
   cross-validation halves (the distance between Z_R fitted on A and on B),
   and between neighbouring re-fit levels of the region hierarchy.
@@ -306,6 +442,17 @@ at the level nearest to the earlier k = 2 split:
 6. Band DP against brute force on a short grid (G = 12, K ≤ 4), and on a
    synthetic piecewise-constant profile with noise: cross-validation finds
    the true K and the boundaries within one grid bin.
+7. The phantoms of `phantoms.py` (P1–P9) with three synthetic echoes (fluid
+   dim at every echo, a stria band with a faster decay): step 7 keeps the
+   results of `grow_pial.py` on them (seam on the dark line and through its
+   holes, no seam on the stria, no seam at a sulcus end, the WM topology
+   kept).
+8. The frame does not depend on the pial surface: changing the rim changes
+   neither the streamlines nor d.
+9. A phantom with a known band template in both banks and a fused stretch
+   with no visible line, the banks of different thicknesses: the cut goes
+   where each bank's profile ends, within 1 voxel, not to the midpoint.
+10. On the phantoms, the outer loop stops (n_stop) within it_max iterations.
 
 ## Prototype layout and dependencies
 
@@ -315,6 +462,11 @@ In `example/`:
 - `layer_refine_eval.py`: the evaluation sweep;
 - `test_layer_refine.py`: the tests above;
 - `run_pipeline.py`: step 0 (metric crop).
+- `joint_refine.py`: the frame, step 7 and the outer loop (uses
+  `topo_grow.py`, `wellcomposed.py`, `mesh_mt.py`);
+- `test_joint_refine.py`: tests 7–10.
+
+The joint surfaces also need the three echo images of the FLASH.
 
 Dependencies: numpy, scipy, nibabel, scikit-learn (in nixpkgs), PyMaxflow
 (Boykov–Kolmogorov min-cut; **not in nixpkgs**: package it from PyPI in the
@@ -336,6 +488,11 @@ example flake).
 | Weights | Normalized units. |
 | Evaluation | Existing measures plus laminar ones; fixed against adaptive layers, K_R maps and residual-vs-K curves, band stability. |
 | Implementation | Python prototype in `example/`; LayNii C++ port when settled. |
+| Surfaces | Estimated jointly with the layers: the fluid is a band, and an outer loop alternates between the model and the geometry. |
+| White surface | Fixed. It anchors the frame. |
+| Columns and depth | From streamlines of the distance to the white surface, independent of the pial surface. |
+| Data | The three echoes as one vector per voxel. |
+| Seams | Fluid against tissue (topology-preserving competing growth), with costs from the fluid and band templates in place of the darkness measure. |
 
 ## Choices made in this plan (not yet confirmed)
 
@@ -348,6 +505,14 @@ example flake).
 - The band DP works in relative depth (each column's own m), so a band
   boundary sits at the same fraction of thickness in every column before
   the nudge.
+- Joint surfaces: the min-cut cut placement (step 7.3) is kept. On V1V2 with
+  the echo-2 darkness it removed the ladder seams at (69, 65, 69) and
+  (68, 60, 71), and the pial solid had 21 digital handles against 23 without
+  it. (The genus of the trimmed pial mesh rose from 34.5 to 38, but from
+  boundary loops at the trim, not from handles.)
+- Joint surfaces: the form of the growth costs (β), the thickness prior in
+  the growth (γ, T̂_c), the region level for step 7 (N_geo), the stopping rule,
+  the streamline stops (ridge, D_max), and equidistant r first.
 - The cross-validation split into random halves of columns, with the held-out
   columns' gain and offset re-fitted to the training template; K_max = 8;
   t_min = 0.05.
